@@ -1,12 +1,38 @@
+# The MIT License (MIT)
+# Copyright (c) 2016, 2017 by the ESA CCI Toolbox development team and contributors
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+# of the Software, and to permit persons to whom the Software is furnished to do
+# so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
 import os
 import time
+from typing import Optional
 
-import numba as nb
-import numpy as np
 import xarray as xr
 
 
-def write_pyramid(input_file, output_dir, output_name, tile_width, tile_height, level_count):
+def write_pyramid(input_file: str,
+                  output_dir: str = '.',
+                  output_name: Optional[str] = None,
+                  write_fr: bool = False,
+                  tile_width: Optional[int] = None,
+                  tile_height: Optional[int] = None):
     basename, ext = os.path.splitext(os.path.basename(input_file))
     if output_name is None or output_name.strip() == '':
         output_name = basename + '.pyramid'
@@ -45,56 +71,39 @@ def write_pyramid(input_file, output_dir, output_name, tile_width, tile_height, 
         else:
             print('warning: variable {v} not included, not spatial'.format(v=var_name))
 
-    ts_count = 24
-    tw_out = np.empty(ts_count, dtype=np.int32)
-    th_out = np.empty(ts_count, dtype=np.int32)
-    count = pyramid_subdivision(w_max, h_max,
-                                min(tile_width, tile_height) // 4,
-                                max(tile_width, tile_height) * 4,
-                                tw_out, th_out)
-    if count == 0:
-        raise ValueError(
-            'size does not allow for subdivision into any pyramid levels: {w} x {h}'.format(w=w_max, h=h_max))
+    (w, h), (tw, th), (nt0x, nt0y), nl = rect_subdivision(w_max, h_max,
+                                                          keep_s=True,
+                                                          tw_opt=min(w_max, tile_width),
+                                                          th_opt=min(h_max, tile_height))
 
-    dx_min = 2 * w_max
-    dy_min = 2 * h_max
-    tw_best = -1
-    th_best = -1
-    for i in range(ts_count):
-        tw = tw_out[i]
-        th = th_out[i]
-        if tw > 0:
-            dx = abs(tw - tile_width)
-            if dx < dx_min:
-                dx_min = dx
-                tw_best = tw
-        if th > 0:
-            dy = abs(th - tile_height)
-            if dy < dy_min:
-                dy_min = dy
-                th_best = th
-
-    if tw_best == -1 or th_best == -1:
-        raise ValueError('failed to determine best tile size')
-
-    print('number of pyramid levels: {c}'.format(c=count + 1))
-    print('best tile sizes are: {tw} x {th}'.format(tw=tw_best, th=th_best))
+    print('number of pyramid levels: {nl}'.format(nl=nl))
+    print('number of tiles at level zero: {nx} x {ny}'.format(nx=nt0x, ny=nt0y))
+    print('pyramid tile size: {tw} x {th}'.format(tw=tw, th=th))
+    print('image size at level zero: {w} x {h}'.format(w=nt0x * tw, h=nt0y * th))
+    print('image size at level {k}: {w} x {h}'.format(k=nl - 1, w=w, h=h))
 
     ds_orig = ds
 
     for var_name in selected_var_names:
-        var = ds[var_name][...].chunk(dict(lat=th_best, lon=tw_best))
-        var.encoding['chunksizes'] = get_chunk_sizes(var, tw_best, th_best)
+        var = ds[var_name][...].chunk(dict(lon=tw, lat=th))
+        var.encoding['chunksizes'] = get_chunk_sizes(var, tw, th)
         # print(downsampled_var.encoding)
         ds[var_name] = var
 
-    print('writing hi-res dataset at level {c}'.format(c=count))
     t0 = time.clock()
-    ds.to_netcdf(os.path.join(target_dir, 'L{c}.nc'.format(c=count)), format='netCDF4', engine='netcdf4')
-    print('done after {dt} seconds'.format(dt=time.clock() - t0))
 
-    for i in range(count):
-        c = count - i - 1
+    k = nl - 1
+    if write_fr:
+        print('writing full-res dataset at level {k}'.format(k=k))
+        ds.to_netcdf(os.path.join(target_dir, 'L{k}.nc'.format(k=k)), format='netCDF4', engine='netcdf4')
+        print('done after {dt} seconds'.format(dt=time.clock() - t0))
+    else:
+        print('write link to full-res dataset at level {k}'.format(k=k))
+        with open(os.path.join(target_dir, 'L{k}.nc.lnk'.format(k=k)), 'w') as fp:
+            fp.write(input_file)
+
+    for i in range(1, nl):
+        k = nl - 1 - i
 
         coords = dict(ds.coords)
         coords['lon'] = ds.coords['lon'][::2]
@@ -104,15 +113,15 @@ def write_pyramid(input_file, output_dir, output_name, tile_width, tile_height, 
         for var_name in selected_var_names:
             var = ds[var_name]
             downsampled_var = var[..., ::2, ::2]
-            downsampled_var.encoding['chunksizes'] = get_chunk_sizes(var, tw_best, th_best)
+            downsampled_var.encoding['chunksizes'] = get_chunk_sizes(var, tw, th)
             # print(downsampled_var.encoding)
             data_vars[var_name] = downsampled_var
 
-        print('constructing lower-res dataset at level {c}'.format(c=c))
+        print('constructing lower-res dataset at level {k}'.format(k=k))
         ds = xr.Dataset(data_vars=data_vars, coords=coords, attrs=ds_orig.attrs)
-        print('writing lower-res dataset at level {c}...'.format(c=c))
+        print('writing lower-res dataset at level {k}...'.format(k=k))
         t1 = time.clock()
-        ds.to_netcdf(os.path.join(target_dir, 'L{c}.nc'.format(c=c)), format='netCDF4', engine='netcdf4')
+        ds.to_netcdf(os.path.join(target_dir, 'L{k}.nc'.format(k=k)), format='netCDF4', engine='netcdf4')
         print('done after {dt} seconds'.format(dt=time.clock() - t1))
 
     ds_orig.close()
@@ -136,59 +145,92 @@ def is_spatial_var(var):
            and dims[-1] == 'lon' and dims[-2] == 'lat'
 
 
-@nb.jit(nopython=True)
-def pyramid_subdivision_count(s_max: int, ts: int, ntl0_max: int = 1):
-    """
-    Compute number of times *w* can be divided by 2 without remainder and while the result is still
-    integer-dividable by *ts*.
-    """
-    count = 0
-    s = s_max
-    while s % 2 == 0 and s % ts == 0 and (s // ts) % 2 == 0 and (s // ts) > ntl0_max:
-        s //= 2
-        count += 1
-    return count
+def rect_subdivision(w_min: int, h_min: int,
+                     keep_s: bool = False,
+                     tw_opt: Optional[int] = None,
+                     th_opt: Optional[int] = None,
+                     tw_min: Optional[int] = None,
+                     th_min: Optional[int] = None,
+                     tw_max: Optional[int] = None,
+                     th_max: Optional[int] = None,
+                     nt0_max: Optional[int] = None,
+                     nl_max: Optional[int] = None):
+    subdivs_w = size_subdivisions(w_min, keep_s=keep_s, ts_opt=tw_opt, ts_min=tw_min, ts_max=tw_max, nt0_max=nt0_max,
+                                  nl_max=nl_max)
+    subdivs_h = size_subdivisions(h_min, keep_s=keep_s, ts_opt=th_opt, ts_min=th_min, ts_max=th_max, nt0_max=nt0_max,
+                                  nl_max=nl_max)
+    print(subdivs_w)
+    print(subdivs_h)
+    if not subdivs_w or not subdivs_h:
+        raise ValueError(
+            'size {w} x {h} does not allow for pyramid subdivision with given constraints'.format(w=w_min, h=h_min))
+
+    w_max, tw, nt0_w, nl_w = subdivs_w[0]
+    h_max, th, nt0_h, nl_h = subdivs_h[0]
+    if keep_s:
+        assert w_min == w_max and h_min == h_max
+
+    if nl_w < nl_h:
+        nl = nl_w
+        nt0_h = h_max // (1 << (nl - 1)) // th
+    elif nl_w > nl_h:
+        nl = nl_h
+        nt0_w = w_max // (1 << (nl - 1)) // tw
+    else:
+        nl = nl_w
+
+    return (w_max, h_max), (tw, th), (nt0_w, nt0_h), nl
 
 
-@nb.jit(nopython=True)
-def pyramid_subdivision(w_max: int, h_max: int,
-                        ts_min: int, ts_max: int,
-                        tw_out, th_out,
-                        ntl0x_max: int = 1,
-                        ntl0y_max: int = 1):
-    size = ts_max - ts_min + 1
+def size_subdivisions(s_min: int,
+                      keep_s: bool = False,
+                      ts_opt: Optional[int] = None,
+                      ts_min: Optional[int] = None,
+                      ts_max: Optional[int] = None,
+                      nt0_max: Optional[int] = None,
+                      nl_max: Optional[int] = None):
+    if s_min < 1:
+        raise ValueError('invalid s_min')
 
-    cx = np.empty(ts_max - ts_min + 1, dtype=np.int32)
-    cy = np.empty(ts_max - ts_min + 1, dtype=np.int32)
-    for i in range(size):
-        ts = ts_min + i
-        cx[i] = pyramid_subdivision_count(w_max, ts, ntl0_max=ntl0x_max)
-        cy[i] = pyramid_subdivision_count(h_max, ts, ntl0_max=ntl0y_max)
+    ts_min = ts_min or min(s_min, (ts_opt // 2 if ts_opt else 200))
+    ts_max = ts_max or min(s_min, (ts_opt * 2 if ts_opt else 1200))
+    nt0_max = nt0_max or 8
+    nl_max = nl_max or 16
 
-    cx_max = -1
-    cy_max = -1
-    for i in range(size):
-        cx_max = max(cx[i], cx_max)
-        cy_max = max(cy[i], cy_max)
+    if ts_min < 1:
+        raise ValueError('invalid ts_min')
+    if ts_max < 1:
+        raise ValueError('invalid ts_max')
+    if ts_opt < 1:
+        raise ValueError('invalid ts_opt')
+    if nt0_max < 1:
+        raise ValueError('invalid nt0_max')
+    if nl_max < 1:
+        raise ValueError('invalid nl_max')
 
-    c = min(cx_max, cy_max)
+    subdivisions = []
+    for ts in range(ts_min, ts_max + 1):
+        s_max_max = s_min if keep_s else s_min + ts - 1
+        for nt0 in range(1, nt0_max):
+            s_max = nt0 * ts
+            if s_max > s_max_max:
+                break
+            for nl in range(2, nl_max):
+                s_max = (1 << (nl - 1)) * nt0 * ts
+                if s_max >= s_min:
+                    if s_max > s_max_max:
+                        break
+                    rec = s_max, ts, nt0, nl
+                    subdivisions.append(rec)
 
-    for ix in range(tw_out.size):
-        tw_out[ix] = 0
-    for iy in range(th_out.size):
-        th_out[iy] = 0
+    # maximize nl
+    subdivisions.sort(key=lambda rec: rec[3], reverse=True)
+    if ts_opt:
+        # minimize |ts - ts_opt|
+        subdivisions.sort(key=lambda rec: abs(rec[1] - ts_opt))
+    # minimize nt0 * ts
+    subdivisions.sort(key=lambda rec: rec[2] * rec[1])
+    # minimize s_max - s_min
+    subdivisions.sort(key=lambda rec: rec[0] - s_min)
 
-    if c <= 0:
-        return 0
-
-    ix = 0
-    iy = 0
-    for i in range(size):
-        if cx[i] >= c and ix < tw_out.size:
-            tw_out[ix] = ts_min + i
-            ix += 1
-        if cy[i] >= c and iy < th_out.size:
-            th_out[iy] = ts_min + i
-            iy += 1
-
-    return c
+    return subdivisions

@@ -23,8 +23,14 @@
 import os
 import time
 from typing import Optional
+import json
 
 import xarray as xr
+import numpy as np
+
+MODE_LE = -1
+MODE_EQ = 0
+MODE_GE = 1
 
 
 def write_pyramid(input_file: str,
@@ -41,7 +47,10 @@ def write_pyramid(input_file: str,
 
     os.makedirs(target_dir, exist_ok=True)
 
-    ds = xr.open_dataset(input_file, chunks={})
+    ds = xr.open_dataset(input_file)
+
+    lon0, lat0, delta_lon, delta_lat = get_geo_rectangle_from_dataset(ds, eps=1e-4)
+    print((lon0, lat0, delta_lon, delta_lat))
 
     w_max, h_max = -1, -1
 
@@ -71,10 +80,17 @@ def write_pyramid(input_file: str,
         else:
             print('warning: variable {v} not included, not spatial'.format(v=var_name))
 
-    (w, h), (tw, th), (nt0x, nt0y), nl = rect_subdivision(w_max, h_max,
-                                                          keep_s=True,
-                                                          tw_opt=min(w_max, tile_width),
-                                                          th_opt=min(h_max, tile_height))
+    w_mode = MODE_GE
+    if delta_lon == 360.:
+        w_mode = MODE_EQ
+
+    h_mode = MODE_GE
+    if delta_lat == 180. or lat0 == -90.:
+        h_mode = MODE_EQ
+
+    (w, h), (tw, th), (nt0x, nt0y), nl = rect_subdivision(w_max, h_max, w_mode=w_mode, h_mode=h_mode,
+                                                          tw_opt=min(w_max, tile_width or 512),
+                                                          th_opt=min(h_max, tile_height or 512))
 
     print('number of pyramid levels: {nl}'.format(nl=nl))
     print('number of tiles at level zero: {nx} x {ny}'.format(nx=nt0x, ny=nt0y))
@@ -82,6 +98,26 @@ def write_pyramid(input_file: str,
     print('image size at level zero: {w} x {h}'.format(w=nt0x * tw, h=nt0y * th))
     print('image size at level {k}: {w} x {h}'.format(k=nl - 1, w=w, h=h))
 
+    ds.close()
+    import math
+
+    new_delta_lon = w * delta_lon / w_max
+    new_delta_lat = h * delta_lat / h_max
+
+    with open(os.path.join(target_dir, 'tiling-scheme.json'), 'w') as fp:
+        json.dump(dict(numberOfLevelZeroTilesX=nt0x,
+                       numberOfLevelZeroTilesY=nt0y,
+                       tileWidth=tw,
+                       tileHeight=th,
+                       minimumLevel=0,
+                       maximumLevel=nl - 1,
+                       rectangle=dict(west=math.radians(lon0),
+                                      south=math.radians(lat0),
+                                      east=math.radians((180. + lon0 + new_delta_lon) % 360. - 180.),
+                                      north=math.radians(lat0+new_delta_lat))
+                       ), fp, indent=4)
+
+    ds = xr.open_dataset(input_file, chunks=dict(lon=10*tw, lat=10*th))
     ds_orig = ds
 
     for var_name in selected_var_names:
@@ -131,6 +167,47 @@ def write_pyramid(input_file: str,
     return target_dir
 
 
+def get_geo_rectangle_from_dataset(ds: xr.Dataset, eps=1e-6):
+    lon = ds.coords['lon']
+    lat = ds.coords['lat']
+    return get_geo_rectangle(lon, lat, eps=eps)
+
+
+def get_geo_rectangle(lon, lat, eps=1e-6):
+    dlon = np.gradient(lon)
+    if (dlon.max() - dlon.min()) >= eps:
+        lon = np.where(lon < 0., 360. + lon, lon)
+        dlon = np.gradient(lon)
+        if (dlon.max() - dlon.min()) >= eps:
+            raise ValueError('coordinate variable "lon" not is not equi-distant')
+
+    dlat = np.gradient(lat)
+    if (dlat.max() - dlat.min()) >= eps:
+        raise ValueError('coordinate variable "lat" not is not equi-distant')
+
+    lon1 = lon[0] - 0.5 * dlon[0]
+    lon2 = lon[-1] + 0.5 * dlon[0]
+    if dlat[0] > 0.0:
+        lat1 = lat[0] - 0.5 * dlat[0]
+        lat2 = lat[-1] + 0.5 * dlat[0]
+    else:
+        lat1 = lat[-1] + 0.5 * dlat[0]
+        lat2 = lat[0] - 0.5 * dlat[0]
+
+    if lon1 < lon2:
+        width = lon2 - lon1
+    else:
+        width = 360 + lon2 - lon1
+    height = lat2 - lat1
+    if abs(360. - width) < eps:
+        lon1 = -180.
+        width = 360.
+    if abs(180. - height) < eps:
+        lat1 = -90.
+        height = 180.
+    return lon1, lat1, width, height
+
+
 def get_chunk_sizes(var, tile_width, tile_height):
     chunk_sizes = len(var.shape) * [1]
     chunk_sizes[-1] = tile_width
@@ -146,18 +223,15 @@ def is_spatial_var(var):
 
 
 def rect_subdivision(w_min: int, h_min: int,
-                     keep_s: bool = False,
-                     tw_opt: Optional[int] = None,
-                     th_opt: Optional[int] = None,
-                     tw_min: Optional[int] = None,
-                     th_min: Optional[int] = None,
-                     tw_max: Optional[int] = None,
-                     th_max: Optional[int] = None,
+                     w_mode: int = MODE_EQ, h_mode: int = MODE_EQ,
+                     tw_opt: Optional[int] = None, th_opt: Optional[int] = None,
+                     tw_min: Optional[int] = None, th_min: Optional[int] = None,
+                     tw_max: Optional[int] = None, th_max: Optional[int] = None,
                      nt0_max: Optional[int] = None,
                      nl_max: Optional[int] = None):
-    subdivs_w = size_subdivisions(w_min, keep_s=keep_s, ts_opt=tw_opt, ts_min=tw_min, ts_max=tw_max, nt0_max=nt0_max,
+    subdivs_w = size_subdivisions(w_min, s_mode=w_mode, ts_opt=tw_opt, ts_min=tw_min, ts_max=tw_max, nt0_max=nt0_max,
                                   nl_max=nl_max)
-    subdivs_h = size_subdivisions(h_min, keep_s=keep_s, ts_opt=th_opt, ts_min=th_min, ts_max=th_max, nt0_max=nt0_max,
+    subdivs_h = size_subdivisions(h_min, s_mode=h_mode, ts_opt=th_opt, ts_min=th_min, ts_max=th_max, nt0_max=nt0_max,
                                   nl_max=nl_max)
     print(subdivs_w)
     print(subdivs_h)
@@ -167,7 +241,7 @@ def rect_subdivision(w_min: int, h_min: int,
 
     w_max, tw, nt0_w, nl_w = subdivs_w[0]
     h_max, th, nt0_h, nl_h = subdivs_h[0]
-    if keep_s:
+    if w_mode:
         assert w_min == w_max and h_min == h_max
 
     if nl_w < nl_h:
@@ -182,18 +256,18 @@ def rect_subdivision(w_min: int, h_min: int,
     return (w_max, h_max), (tw, th), (nt0_w, nt0_h), nl
 
 
-def size_subdivisions(s_min: int,
-                      keep_s: bool = False,
+def size_subdivisions(s_act: int,
+                      s_mode: int = MODE_EQ,
                       ts_opt: Optional[int] = None,
                       ts_min: Optional[int] = None,
                       ts_max: Optional[int] = None,
                       nt0_max: Optional[int] = None,
                       nl_max: Optional[int] = None):
-    if s_min < 1:
-        raise ValueError('invalid s_min')
+    if s_act < 1:
+        raise ValueError('invalid s_act')
 
-    ts_min = ts_min or min(s_min, (ts_opt // 2 if ts_opt else 200))
-    ts_max = ts_max or min(s_min, (ts_opt * 2 if ts_opt else 1200))
+    ts_min = ts_min or min(s_act, (ts_opt // 2 if ts_opt else 200))
+    ts_max = ts_max or min(s_act, (ts_opt * 2 if ts_opt else 1200))
     nt0_max = nt0_max or 8
     nl_max = nl_max or 16
 
@@ -210,16 +284,26 @@ def size_subdivisions(s_min: int,
 
     subdivisions = []
     for ts in range(ts_min, ts_max + 1):
-        s_max_max = s_min if keep_s else s_min + ts - 1
+        s_max_min = s_act if s_mode else s_act - (ts - 1)
+        s_max_max = s_act if s_mode else s_act + (ts - 1)
         for nt0 in range(1, nt0_max):
             s_max = nt0 * ts
             if s_max > s_max_max:
                 break
             for nl in range(2, nl_max):
                 s_max = (1 << (nl - 1)) * nt0 * ts
-                if s_max >= s_min:
-                    if s_max > s_max_max:
-                        break
+                ok = False
+                if s_mode == MODE_GE:
+                    if s_max >= s_act:
+                        if s_max > s_max_max:
+                            break
+                        ok = True
+                elif s_mode == MODE_LE:
+                    if s_act >= s_max >= s_max_min:
+                        ok = True
+                elif s_max == s_act:
+                    ok = True
+                if ok:
                     rec = s_max, ts, nt0, nl
                     subdivisions.append(rec)
 
@@ -231,6 +315,6 @@ def size_subdivisions(s_min: int,
     # minimize nt0 * ts
     subdivisions.sort(key=lambda rec: rec[2] * rec[1])
     # minimize s_max - s_min
-    subdivisions.sort(key=lambda rec: rec[0] - s_min)
+    subdivisions.sort(key=lambda rec: rec[0] - s_act)
 
     return subdivisions

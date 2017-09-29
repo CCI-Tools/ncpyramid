@@ -20,13 +20,13 @@
 # SOFTWARE.
 
 
+import json
 import os
 import time
 from typing import Optional
-import json
 
-import xarray as xr
 import numpy as np
+import xarray as xr
 
 MODE_LE = -1
 MODE_EQ = 0
@@ -88,9 +88,9 @@ def write_pyramid(input_file: str,
     if delta_lat == 180. or lat0 == -90.:
         h_mode = MODE_EQ
 
-    (w, h), (tw, th), (nt0x, nt0y), nl = rect_subdivision(w_max, h_max, w_mode=w_mode, h_mode=h_mode,
-                                                          tw_opt=min(w_max, tile_width or 512),
-                                                          th_opt=min(h_max, tile_height or 512))
+    (w, h), (tw, th), (nt0x, nt0y), nl = pow2_2d_subdivision(w_max, h_max, w_mode=w_mode, h_mode=h_mode,
+                                                             tw_opt=min(w_max, tile_width or 512),
+                                                             th_opt=min(h_max, tile_height or 512))
 
     print('number of pyramid levels: {nl}'.format(nl=nl))
     print('number of tiles at level zero: {nx} x {ny}'.format(nx=nt0x, ny=nt0y))
@@ -114,10 +114,10 @@ def write_pyramid(input_file: str,
                        rectangle=dict(west=math.radians(lon0),
                                       south=math.radians(lat0),
                                       east=math.radians((180. + lon0 + new_delta_lon) % 360. - 180.),
-                                      north=math.radians(lat0+new_delta_lat))
+                                      north=math.radians(lat0 + new_delta_lat))
                        ), fp, indent=4)
 
-    ds = xr.open_dataset(input_file, chunks=dict(lon=10*tw, lat=10*th))
+    ds = xr.open_dataset(input_file, chunks=dict(lon=10 * tw, lat=10 * th))
     ds_orig = ds
 
     for var_name in selected_var_names:
@@ -167,13 +167,13 @@ def write_pyramid(input_file: str,
     return target_dir
 
 
-def get_geo_rectangle_from_dataset(ds: xr.Dataset, eps=1e-6):
+def get_geo_rectangle_from_dataset(ds: xr.Dataset, eps: float=1e-6):
     lon = ds.coords['lon']
     lat = ds.coords['lat']
     return get_geo_rectangle(lon, lat, eps=eps)
 
 
-def get_geo_rectangle(lon, lat, eps=1e-6):
+def get_geo_rectangle(lon: np.ndarray, lat: np.ndarray, eps: float = 1e-6):
     dlon = np.gradient(lon)
     if (dlon.max() - dlon.min()) >= eps:
         lon = np.where(lon < 0., 360. + lon, lon)
@@ -208,66 +208,99 @@ def get_geo_rectangle(lon, lat, eps=1e-6):
     return lon1, lat1, width, height
 
 
-def get_chunk_sizes(var, tile_width, tile_height):
+def get_chunk_sizes(var: xr.DataArray, tile_width: int, tile_height: int):
     chunk_sizes = len(var.shape) * [1]
     chunk_sizes[-1] = tile_width
     chunk_sizes[-2] = tile_height
     return chunk_sizes
 
 
-def is_spatial_var(var):
+def is_spatial_var(var: xr.DataArray):
     shape = var.shape
     dims = var.dims
-    return len(shape) >= 2 and len(shape) == len(dims) \
-           and dims[-1] == 'lon' and dims[-2] == 'lat'
+    return len(shape) >= 2 and len(shape) == len(dims) and dims[-1] == 'lon' and dims[-2] == 'lat'
 
 
-def rect_subdivision(w_min: int, h_min: int,
-                     w_mode: int = MODE_EQ, h_mode: int = MODE_EQ,
-                     tw_opt: Optional[int] = None, th_opt: Optional[int] = None,
-                     tw_min: Optional[int] = None, th_min: Optional[int] = None,
-                     tw_max: Optional[int] = None, th_max: Optional[int] = None,
-                     nt0_max: Optional[int] = None,
-                     nl_max: Optional[int] = None):
-    subdivs_w = size_subdivisions(w_min, s_mode=w_mode, ts_opt=tw_opt, ts_min=tw_min, ts_max=tw_max, nt0_max=nt0_max,
-                                  nl_max=nl_max)
-    subdivs_h = size_subdivisions(h_min, s_mode=h_mode, ts_opt=th_opt, ts_min=th_min, ts_max=th_max, nt0_max=nt0_max,
-                                  nl_max=nl_max)
-    print(subdivs_w)
-    print(subdivs_h)
-    if not subdivs_w or not subdivs_h:
-        raise ValueError(
-            'size {w} x {h} does not allow for pyramid subdivision with given constraints'.format(w=w_min, h=h_min))
+def pow2_2d_subdivision(w: int, h: int,
+                        w_mode: int = MODE_EQ, h_mode: int = MODE_EQ,
+                        tw_opt: Optional[int] = None, th_opt: Optional[int] = None,
+                        tw_min: Optional[int] = None, th_min: Optional[int] = None,
+                        tw_max: Optional[int] = None, th_max: Optional[int] = None,
+                        nt0_max: Optional[int] = None,
+                        nl_max: Optional[int] = None):
+    """
+    Get a pyramidal quad-tree subdivision of a 2D image rectangle given by image width *w* and height *h*.
+    We want all pyramid levels to use the same tile size *tw*, *th*. All but the lowest resolution level, level zero,
+    shall have 2 times the number of tiles than in a previous level in x- and y-direction.
 
-    w_max, tw, nt0_w, nl_w = subdivs_w[0]
-    h_max, th, nt0_h, nl_h = subdivs_h[0]
-    if w_mode:
-        assert w_min == w_max and h_min == h_max
+    As there can be multiple of such subdivisions, we select an optimum subdivision by constraints. We want
+    1. the resolution of the highest pyramid level, *nl* - 1, to be as close as possible to *w*, *h*;
+    2. the resolution of level zero to be as small as possible;
+    3. the tile sizes *tw*, *th* to be as close as possible to *tw_opt*, *th_opt*, if given;
+    4. a maximum number of levels.
 
-    if nl_w < nl_h:
-        nl = nl_w
-        nt0_h = h_max // (1 << (nl - 1)) // th
-    elif nl_w > nl_h:
-        nl = nl_h
-        nt0_w = w_max // (1 << (nl - 1)) // tw
+    :param w: image width
+    :param h: image height
+    :param w_mode: optional mode for horizontal direction, -1: *w_act* <= *w*, 0: *w_act* == *w*, +1: *w_act* >= *w*
+    :param h_mode: optional mode for vertical direction, -1: *h_act* <= *h*, 0: *h_act* == *h*, +1: *h_act* >= *h*
+    :param tw_opt: optional optimum tile width
+    :param th_opt: optional optimum tile height
+    :param tw_min: optional minimum tile width
+    :param th_min: optional minimum tile height
+    :param tw_max: optional maximum tile width
+    :param th_max: optional maximum tile height
+    :param nt0_max: optional maximum number of tiles at level zero of pyramid
+    :param nl_max: optional maximum number of pyramid levels
+    :return: a tuple ((*w_act*, *h_act*), (*tw*, *th*), (*nt0_x*, *nt0_y*), *nl*) with
+             *w_act*, *h_act* being the final image width and height in the pyramids's highest resolution level;
+             *tw*, *th* being the tile width and height;
+             *nt0_x*, *nt0_y* being the number of tiles at level zero of pyramid in horizontal and vertical direction;
+             and *nl* being the total number of pyramid levels.
+    """
+    w_act, tw, nt0_x, nl_x = pow2_1d_subdivision(w, s_mode=w_mode,
+                                                 ts_opt=tw_opt, ts_min=tw_min, ts_max=tw_max,
+                                                 nt0_max=nt0_max, nl_max=nl_max)
+    h_act, th, nt0_y, nl_y = pow2_1d_subdivision(h, s_mode=h_mode,
+                                                 ts_opt=th_opt, ts_min=th_min, ts_max=th_max,
+                                                 nt0_max=nt0_max, nl_max=nl_max)
+    if nl_x < nl_y:
+        nl = nl_x
+        nt0_y = h_act // (1 << (nl - 1)) // th
+    elif nl_x > nl_y:
+        nl = nl_y
+        nt0_x = w_act // (1 << (nl - 1)) // tw
     else:
-        nl = nl_w
+        nl = nl_x
 
-    return (w_max, h_max), (tw, th), (nt0_w, nt0_h), nl
+    return (w_act, h_act), (tw, th), (nt0_x, nt0_y), nl
 
 
-def size_subdivisions(s_act: int,
-                      s_mode: int = MODE_EQ,
-                      ts_opt: Optional[int] = None,
-                      ts_min: Optional[int] = None,
-                      ts_max: Optional[int] = None,
-                      nt0_max: Optional[int] = None,
-                      nl_max: Optional[int] = None):
-    if s_act < 1:
-        raise ValueError('invalid s_act')
+def pow2_1d_subdivision(s_act: int,
+                        s_mode: int = MODE_EQ,
+                        ts_opt: Optional[int] = None,
+                        ts_min: Optional[int] = None,
+                        ts_max: Optional[int] = None,
+                        nt0_max: Optional[int] = None,
+                        nl_max: Optional[int] = None):
+    return pow2_1d_subdivisions(s_act,
+                                s_mode=s_mode,
+                                ts_opt=ts_opt,
+                                ts_min=ts_min, ts_max=ts_max,
+                                nt0_max=nt0_max, nl_max=nl_max)[0]
 
-    ts_min = ts_min or min(s_act, (ts_opt // 2 if ts_opt else 200))
-    ts_max = ts_max or min(s_act, (ts_opt * 2 if ts_opt else 1200))
+
+def pow2_1d_subdivisions(s: int,
+                         s_mode: int = MODE_EQ,
+                         ts_opt: Optional[int] = None,
+                         ts_min: Optional[int] = None,
+                         ts_max: Optional[int] = None,
+                         nt0_max: Optional[int] = None,
+                         nl_max: Optional[int] = None):
+    if s < 1:
+        raise ValueError('invalid s')
+
+    ts_min = ts_min or min(s, (ts_opt // 2 if ts_opt else 200))
+    ts_max = ts_max or min(s, (ts_opt * 2 if ts_opt else 1200))
     nt0_max = nt0_max or 8
     nl_max = nl_max or 16
 
@@ -275,7 +308,7 @@ def size_subdivisions(s_act: int,
         raise ValueError('invalid ts_min')
     if ts_max < 1:
         raise ValueError('invalid ts_max')
-    if ts_opt < 1:
+    if ts_opt is not None and ts_opt < 1:
         raise ValueError('invalid ts_opt')
     if nt0_max < 1:
         raise ValueError('invalid nt0_max')
@@ -284,8 +317,8 @@ def size_subdivisions(s_act: int,
 
     subdivisions = []
     for ts in range(ts_min, ts_max + 1):
-        s_max_min = s_act if s_mode else s_act - (ts - 1)
-        s_max_max = s_act if s_mode else s_act + (ts - 1)
+        s_max_min = s if s_mode == MODE_EQ or s_mode == MODE_GE else s - (ts - 1)
+        s_max_max = s if s_mode == MODE_EQ or s_mode == MODE_LE else s + (ts - 1)
         for nt0 in range(1, nt0_max):
             s_max = nt0 * ts
             if s_max > s_max_max:
@@ -294,27 +327,33 @@ def size_subdivisions(s_act: int,
                 s_max = (1 << (nl - 1)) * nt0 * ts
                 ok = False
                 if s_mode == MODE_GE:
-                    if s_max >= s_act:
+                    if s_max >= s:
                         if s_max > s_max_max:
                             break
                         ok = True
                 elif s_mode == MODE_LE:
-                    if s_act >= s_max >= s_max_min:
+                    if s >= s_max >= s_max_min:
                         ok = True
-                elif s_max == s_act:
-                    ok = True
+                else:  # s_mode == MODE_EQ:
+                    if s_max == s:
+                        ok = True
+                    elif s_max > s:
+                        break
                 if ok:
                     rec = s_max, ts, nt0, nl
                     subdivisions.append(rec)
 
+    if not subdivisions:
+        return [(s, s, 1, 1)]
+
     # maximize nl
-    subdivisions.sort(key=lambda rec: rec[3], reverse=True)
+    subdivisions.sort(key=lambda r: r[3], reverse=True)
     if ts_opt:
         # minimize |ts - ts_opt|
-        subdivisions.sort(key=lambda rec: abs(rec[1] - ts_opt))
+        subdivisions.sort(key=lambda r: abs(r[1] - ts_opt))
     # minimize nt0 * ts
-    subdivisions.sort(key=lambda rec: rec[2] * rec[1])
+    subdivisions.sort(key=lambda r: r[2] * r[1])
     # minimize s_max - s_min
-    subdivisions.sort(key=lambda rec: rec[0] - s_act)
+    subdivisions.sort(key=lambda r: r[0] - s)
 
     return subdivisions
